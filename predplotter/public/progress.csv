@@ -1,0 +1,6 @@
+run_id,timestamp,label,full_cv,processed_cv
+1,2025-01-01T10:00:00Z,SigLIP baseline,0.736214,0.747270
+2,2025-01-02T10:00:00Z,SigLIP tuned folds,0.758736,0.770204
+3,2025-01-03T10:00:00Z,SigLIP + grid search,0.783918,0.787526
+4,2025-01-03T18:00:00Z,SigLIP + expanded ensemble,0.771830,0.775506
+5,2025-01-03T22:00:00Z,SigLIP inference regressors,0.782666,0.788145

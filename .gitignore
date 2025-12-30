@@ -3,3 +3,6 @@ CSIRO - Image2Biomass Prediction _ Kaggle.html
 CSIRO - Image2Biomass Prediction _ Kaggle_files/
 .idea/
 someone_else.ipynb
+predplotter/node_modules/
+predplotter/.next/
+predplotter/out/
