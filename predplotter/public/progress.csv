@@ -1,1 +1,2 @@
 run_id,timestamp,label,full_cv,processed_cv
+1,2025-12-30T12:58:02.376074,"SigLIP trimmed + TTA",0.784011,0.787076

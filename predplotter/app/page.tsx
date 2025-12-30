@@ -365,10 +365,19 @@ function parseCsvLine(line: string): RunEntry | null {
 function extractFromLog(log: string): { fullCv: number; processedCv: number } | null {
   const fullMatches = [...log.matchAll(/Full CV Score:\s*([0-9.]+)/g)];
   const procMatches = [...log.matchAll(/Processed CV Score:\s*([0-9.]+)/g)];
-  const full = fullMatches.at(-1)?.[1];
-  const proc = procMatches.at(-1)?.[1];
-  if (!full || !proc) return null;
-  return { fullCv: Number(full), processedCv: Number(proc) };
+  if (fullMatches.length === 0 || procMatches.length === 0) return null;
+  const scorePairs: Array<{ full: number; processed: number }> = [];
+  const len = Math.min(fullMatches.length, procMatches.length);
+  for (let i = 0; i < len; i += 1) {
+    const full = Number(fullMatches[i][1]);
+    const processed = Number(procMatches[i][1]);
+    if (!Number.isNaN(full) && !Number.isNaN(processed)) {
+      scorePairs.push({ full, processed });
+    }
+  }
+  if (scorePairs.length === 0) return null;
+  scorePairs.sort((a, b) => b.processed - a.processed);
+  return { fullCv: scorePairs[0].full, processedCv: scorePairs[0].processed };
 }
 
 function computeNextId(entries: RunEntry[]): number {
