@@ -12,7 +12,7 @@ import random
 import argparse
 import shutil
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 from glob import glob
@@ -87,6 +87,13 @@ def flush():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+def _fast_mode_flag() -> bool:
+    try:
+        return bool(int(os.environ.get("FAST_MODE", "0")))
+    except ValueError:
+        return False
+
+
 @dataclass
 class Config:
     DATA_PATH: Path = Path("/kaggle/input/csiro-biomass/")
@@ -98,6 +105,31 @@ class Config:
     legacy_kfolds: int = 8
     dino_kfolds: int = 10
     siglip_hybrid_weight: float = 0.5
+    fast_mode: bool = field(default_factory=_fast_mode_flag)
+    use_semantic_features: bool = True
+    siglip_cluster_sizes: Tuple[int, ...] = (12, 24, 36, 48, 64)
+    dino_cluster_sizes: Tuple[int, ...] = (16, 32, 48, 64, 80)
+    siglip_fast_models: Tuple[str, ...] = field(default_factory=tuple)
+    dino_fast_models: Tuple[str, ...] = field(default_factory=tuple)
+    enable_legacy_siglip: bool = True
+
+    def __post_init__(self):
+        if self.fast_mode:
+            self.stack_kfolds = min(self.stack_kfolds, 5)
+            self.legacy_kfolds = min(self.legacy_kfolds, 4)
+            self.dino_kfolds = min(self.dino_kfolds, 5)
+            self.siglip_cluster_sizes = (16, 32)
+            self.dino_cluster_sizes = (24, 48)
+            self.use_semantic_features = False
+            self.enable_legacy_siglip = False
+            self.siglip_fast_models = (
+                "cat_seed0",
+                "svr_seed0",
+                "xgb_seed0",
+                "bayes_ridge",
+                "elastic_net",
+            )
+            self.dino_fast_models = ("dinov2_cat", "dinov2_xgb")
 
 cfg = Config()
 seeding(cfg.seed)
@@ -1820,29 +1852,38 @@ def main():
         train_siglip_df,
         base_test_siglip_df.copy(),
         embed_prefix='emb',
-        cluster_sizes=(12, 24, 36, 48, 64),
+        cluster_sizes=cfg.siglip_cluster_sizes,
         random_state=cfg.seed,
     )
     train_siglip_df_legacy, test_siglip_df_legacy = append_cluster_features(
         train_siglip_df_legacy,
         base_test_siglip_df.copy(),
         embed_prefix='emb',
-        cluster_sizes=(12, 24, 36, 48, 64),
+        cluster_sizes=cfg.siglip_cluster_sizes,
         random_state=cfg.seed,
     )
 
     flush()
 
-    X_all_emb = np.vstack([train_siglip_df.filter(like="emb").values, test_siglip_df.filter(like="emb").values])
-    try:
-        all_semantic_scores = generate_semantic_features(X_all_emb, model_path=siglip_path)
-        n_train = len(train_siglip_df)
-        sem_train_full = all_semantic_scores[:n_train]
-        sem_test_full = all_semantic_scores[n_train:]
-    except Exception as e:
-        sem_train_full = None; sem_test_full = None
+    sem_train_full = None
+    sem_test_full = None
+    if cfg.use_semantic_features:
+        X_all_emb = np.vstack([train_siglip_df.filter(like="emb").values, test_siglip_df.filter(like="emb").values])
+        try:
+            all_semantic_scores = generate_semantic_features(X_all_emb, model_path=siglip_path)
+            n_train = len(train_siglip_df)
+            sem_train_full = all_semantic_scores[:n_train]
+            sem_test_full = all_semantic_scores[n_train:]
+        except Exception as e:
+            sem_train_full = None
+            sem_test_full = None
+    else:
+        print("[FastMode] Skipping semantic feature generation for SigLIP pillar.")
 
-    feat_engine = SupervisedEmbeddingEngine(n_pca=0.88, n_pls=10, n_gmm=5)
+    if cfg.fast_mode:
+        feat_engine = SupervisedEmbeddingEngine(n_pca=0.95, n_pls=5, n_gmm=3)
+    else:
+        feat_engine = SupervisedEmbeddingEngine(n_pca=0.88, n_pls=10, n_gmm=5)
 
     ensemble_preds = []
     ensemble_weights = []
@@ -1858,44 +1899,34 @@ def main():
         stack_test_features.append(test_preds)
         model_tags.append(name)
         print(f"[Stack] {name}: processed CV {processed_cv:.6f}")
+    def run_siglip_model(name, estimator):
+        if cfg.fast_mode and cfg.siglip_fast_models and name not in cfg.siglip_fast_models:
+            print(f"[FastMode] Skipping SigLIP model {name}")
+            return
+        oof_preds, pred_test = cross_validate(
+            estimator,
+            train_siglip_df,
+            test_siglip_df,
+            feature_engine=feat_engine,
+            semantic_train=sem_train_full,
+            semantic_test=sem_test_full,
+            n_splits_override=cfg.stack_kfolds,
+        )
+        _, proc_score = compare_results(oof_preds, train_siglip_df, return_scores=True)
+        register_model(name, oof_preds, pred_test, proc_score)
 
-    oof_cat, pred_test_cat = cross_validate(CatBoostRegressor(verbose=0, random_seed=cfg.seed), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_cat = compare_results(oof_cat, train_siglip_df, return_scores=True)
-    register_model("cat_seed0", oof_cat, pred_test_cat, proc_cat)
-    oof_svr, pred_test_svr = cross_validate(SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_svr = compare_results(oof_svr, train_siglip_df, return_scores=True)
-    register_model("svr_seed0", oof_svr, pred_test_svr, proc_svr)
-    oof_xgb, pred_test_xgb = cross_validate(XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_xgb = compare_results(oof_xgb, train_siglip_df, return_scores=True)
-    register_model("xgb_seed0", oof_xgb, pred_test_xgb, proc_xgb)
-    oof_br, pred_test_br = cross_validate(BayesianRidge(), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_br = compare_results(oof_br, train_siglip_df, return_scores=True)
-    register_model("bayes_ridge", oof_br, pred_test_br, proc_br)
-    oof_enet, pred_test_enet = cross_validate(ElasticNet(alpha=0.08, l1_ratio=0.4, max_iter=2000), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_enet = compare_results(oof_enet, train_siglip_df, return_scores=True)
-    register_model("elastic_net", oof_enet, pred_test_enet, proc_enet)
-    oof_extra, pred_test_extra = cross_validate(ExtraTreesRegressor(n_estimators=600, max_depth=None, min_samples_split=4, min_samples_leaf=2, random_state=cfg.seed), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_extra = compare_results(oof_extra, train_siglip_df, return_scores=True)
-    register_model("extra_trees", oof_extra, pred_test_extra, proc_extra)
-    oof_xgb2, pred_test_xgb2 = cross_validate(XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed + 1881), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_xgb2 = compare_results(oof_xgb2, train_siglip_df, return_scores=True)
-    register_model("xgb_seed1", oof_xgb2, pred_test_xgb2, proc_xgb2)
-    oof_svr2, pred_test_svr2 = cross_validate(SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, seed=cfg.seed + 2025, n_splits_override=cfg.stack_kfolds)
-    _, proc_svr2 = compare_results(oof_svr2, train_siglip_df, return_scores=True)
-    register_model("svr_seed1", oof_svr2, pred_test_svr2, proc_svr2)
-    oof_cat2, pred_test_cat2 = cross_validate(CatBoostRegressor(verbose=0, random_seed=cfg.seed + 404), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_cat2 = compare_results(oof_cat2, train_siglip_df, return_scores=True)
-    register_model("cat_seed1", oof_cat2, pred_test_cat2, proc_cat2)
-
-    oof_ridge, pred_test_ridge = cross_validate(Ridge(alpha=0.5), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, n_splits_override=cfg.stack_kfolds)
-    _, proc_ridge = compare_results(oof_ridge, train_siglip_df, return_scores=True)
-    register_model("ridge_seed0", oof_ridge, pred_test_ridge, proc_ridge)
-    oof_ridge2, pred_test_ridge2 = cross_validate(Ridge(alpha=0.4), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, seed=cfg.seed + 909, n_splits_override=cfg.stack_kfolds)
-    _, proc_ridge2 = compare_results(oof_ridge2, train_siglip_df, return_scores=True)
-    register_model("ridge_seed1", oof_ridge2, pred_test_ridge2, proc_ridge2)
-    oof_enet2, pred_test_enet2 = cross_validate(ElasticNet(alpha=0.06, l1_ratio=0.35, max_iter=2500), train_siglip_df, test_siglip_df, feature_engine=feat_engine, semantic_train=sem_train_full, semantic_test=sem_test_full, seed=cfg.seed + 707, n_splits_override=cfg.stack_kfolds)
-    _, proc_enet2 = compare_results(oof_enet2, train_siglip_df, return_scores=True)
-    register_model("elastic_net_seed1", oof_enet2, pred_test_enet2, proc_enet2)
+    run_siglip_model("cat_seed0", CatBoostRegressor(verbose=0, random_seed=cfg.seed))
+    run_siglip_model("svr_seed0", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
+    run_siglip_model("xgb_seed0", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed))
+    run_siglip_model("bayes_ridge", BayesianRidge())
+    run_siglip_model("elastic_net", ElasticNet(alpha=0.08, l1_ratio=0.4, max_iter=2000))
+    run_siglip_model("extra_trees", ExtraTreesRegressor(n_estimators=600, max_depth=None, min_samples_split=4, min_samples_leaf=2, random_state=cfg.seed))
+    run_siglip_model("xgb_seed1", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed + 1881))
+    run_siglip_model("svr_seed1", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
+    run_siglip_model("cat_seed1", CatBoostRegressor(verbose=0, random_seed=cfg.seed + 404))
+    run_siglip_model("ridge_seed0", Ridge(alpha=0.5))
+    run_siglip_model("ridge_seed1", Ridge(alpha=0.4))
+    run_siglip_model("elastic_net_seed1", ElasticNet(alpha=0.06, l1_ratio=0.35, max_iter=2500))
     weights = np.array(ensemble_weights, dtype=np.float64)
     weights /= weights.sum()
     pred_stack = np.stack(ensemble_preds, axis=0)
@@ -2108,4 +2139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
