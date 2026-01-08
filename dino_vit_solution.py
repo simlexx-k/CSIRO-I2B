@@ -107,20 +107,23 @@ class Config:
     siglip_hybrid_weight: float = 0.5
     # Execution controls / staging
     run_siglip_stack: bool = True
-    run_siglip_legacy: bool = True
+    run_siglip_legacy: bool = False
     run_dino1: bool = True
     run_mvp: bool = True
-    run_dinov2: bool = True
+    run_dinov2: bool = False
     # Fast-mode / performance controls
-    fast_mode: bool = field(default_factory=_fast_mode_flag)
+    fast_mode: bool = True
     use_semantic_features: bool = True
-    siglip_cluster_sizes: Tuple[int, ...] = (12, 24, 36, 48, 64)
-    dino_cluster_sizes: Tuple[int, ...] = (16, 32, 48, 64, 80)
+    siglip_cluster_sizes: Tuple[int, ...] = (16, 32, 48)
+    dino_cluster_sizes: Tuple[int, ...] = (24, 48, 64)
     siglip_fast_models: Tuple[str, ...] = field(default_factory=tuple)
     dino_fast_models: Tuple[str, ...] = field(default_factory=tuple)
-    enable_legacy_siglip: bool = True
+    enable_legacy_siglip: bool = False
 
     def __post_init__(self):
+        # Environment variable FAST_MODE=1 can still toggle slower runs if needed.
+        if _fast_mode_flag():
+            self.fast_mode = True
         if self.fast_mode:
             self.stack_kfolds = min(self.stack_kfolds, 5)
             self.legacy_kfolds = min(self.legacy_kfolds, 4)
@@ -421,7 +424,7 @@ def append_cluster_features(train_df, test_df, embed_prefix='emb', cluster_sizes
 
 
 class SupervisedEmbeddingEngine(BaseEstimator, TransformerMixin):
-    def __init__(self, n_pca=0.98, n_pls=8, n_gmm=5, random_state=42):
+    def __init__(self, n_pca=0.98, n_pls=4, n_gmm=5, random_state=42):
         self.n_pca = n_pca
         self.n_pls = n_pls
         self.n_gmm = n_gmm
@@ -1899,9 +1902,9 @@ def main():
             print("[FastMode] Skipping semantic feature generation for SigLIP pillar.")
 
         if cfg.fast_mode:
-            feat_engine = SupervisedEmbeddingEngine(n_pca=0.95, n_pls=5, n_gmm=3)
+            feat_engine = SupervisedEmbeddingEngine(n_pca=0.95, n_pls=4, n_gmm=3)
         else:
-            feat_engine = SupervisedEmbeddingEngine(n_pca=0.88, n_pls=10, n_gmm=5)
+            feat_engine = SupervisedEmbeddingEngine(n_pca=0.90, n_pls=8, n_gmm=5)
 
         ensemble_preds = []
         ensemble_weights = []
@@ -2024,10 +2027,10 @@ def main():
             dino_train_df,
             dino_test_df,
             embed_prefix="dino_emb",
-            cluster_sizes=(16, 32, 48, 64, 80),
+            cluster_sizes=cfg.dino_cluster_sizes,
             random_state=cfg.seed,
         )
-        feat_engine_dino = SupervisedEmbeddingEngine(n_pca=0.995, n_pls=10, n_gmm=4)
+        feat_engine_dino = SupervisedEmbeddingEngine(n_pca=0.995, n_pls=6, n_gmm=3)
 
         dino_preds = []
         dino_oof = []
@@ -2140,11 +2143,12 @@ def main():
         pillar_paths["mvp"] = None
 
     blend_candidates = []
+    # Heavier SigLIP emphasis; Dinov2 contributes only if explicitly enabled.
     default_weights = {
-        "siglip": 0.50,
+        "siglip": 0.65,
         "dino": 0.25,
-        "mvp": 0.15,
-        "dinov2": 0.10,
+        "mvp": 0.10,
+        "dinov2": 0.00,
     }
     submission_map = {
         "siglip": Path("submission1.csv"),
