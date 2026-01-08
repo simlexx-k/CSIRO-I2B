@@ -105,6 +105,13 @@ class Config:
     legacy_kfolds: int = 8
     dino_kfolds: int = 10
     siglip_hybrid_weight: float = 0.5
+    # Execution controls / staging
+    run_siglip_stack: bool = True
+    run_siglip_legacy: bool = True
+    run_dino1: bool = True
+    run_mvp: bool = True
+    run_dinov2: bool = True
+    # Fast-mode / performance controls
     fast_mode: bool = field(default_factory=_fast_mode_flag)
     use_semantic_features: bool = True
     siglip_cluster_sizes: Tuple[int, ...] = (12, 24, 36, 48, 64)
@@ -122,6 +129,10 @@ class Config:
             self.dino_cluster_sizes = (24, 48)
             self.use_semantic_features = False
             self.enable_legacy_siglip = False
+            self.run_siglip_legacy = False
+            # Keep MVP for final blend; drop Dinov2 to shorten runtime
+            self.run_dinov2 = False
+            # SigLIP stack dominates in fast mode
             self.siglip_fast_models = (
                 "cat_seed0",
                 "svr_seed0",
@@ -1843,281 +1854,328 @@ def main():
     train_df = pd.read_csv("/kaggle/input/csiro-datasplit/csiro_data_split.csv")
 
     base_train_df = train_df.copy()
-    train_siglip_df = assign_folds(base_train_df.copy(), cfg.stack_kfolds, cfg.seed)
-    train_siglip_df_legacy = assign_folds(base_train_df.copy(), cfg.legacy_kfolds, cfg.seed)
-    siglip_path = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1"
-    base_test_siglip_df = compute_embeddings(model_path=siglip_path, df=test_df, patch_size=520)
-
-    train_siglip_df, test_siglip_df = append_cluster_features(
-        train_siglip_df,
-        base_test_siglip_df.copy(),
-        embed_prefix='emb',
-        cluster_sizes=cfg.siglip_cluster_sizes,
-        random_state=cfg.seed,
-    )
-    train_siglip_df_legacy, test_siglip_df_legacy = append_cluster_features(
-        train_siglip_df_legacy,
-        base_test_siglip_df.copy(),
-        embed_prefix='emb',
-        cluster_sizes=cfg.siglip_cluster_sizes,
-        random_state=cfg.seed,
-    )
-
-    flush()
+    siglip_pred = None
+    pillar_paths = {}
 
     sem_train_full = None
     sem_test_full = None
-    if cfg.use_semantic_features:
-        X_all_emb = np.vstack([train_siglip_df.filter(like="emb").values, test_siglip_df.filter(like="emb").values])
-        try:
-            all_semantic_scores = generate_semantic_features(X_all_emb, model_path=siglip_path)
-            n_train = len(train_siglip_df)
-            sem_train_full = all_semantic_scores[:n_train]
-            sem_test_full = all_semantic_scores[n_train:]
-        except Exception as e:
-            sem_train_full = None
-            sem_test_full = None
-    else:
-        print("[FastMode] Skipping semantic feature generation for SigLIP pillar.")
 
-    if cfg.fast_mode:
-        feat_engine = SupervisedEmbeddingEngine(n_pca=0.95, n_pls=5, n_gmm=3)
-    else:
-        feat_engine = SupervisedEmbeddingEngine(n_pca=0.88, n_pls=10, n_gmm=5)
+    if cfg.run_siglip_stack:
+        train_siglip_df = assign_folds(base_train_df.copy(), cfg.stack_kfolds, cfg.seed)
+        train_siglip_df_legacy = assign_folds(base_train_df.copy(), cfg.legacy_kfolds, cfg.seed)
+        siglip_path = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1"
+        base_test_siglip_df = compute_embeddings(model_path=siglip_path, df=test_df, patch_size=520)
 
-    ensemble_preds = []
-    ensemble_weights = []
-    stack_train_features = []
-    stack_test_features = []
-    model_tags = []
-
-    def register_model(name, oof_preds, test_preds, processed_cv):
-        weight = max(processed_cv, 1e-6)
-        ensemble_preds.append(test_preds)
-        ensemble_weights.append(weight)
-        stack_train_features.append(oof_preds)
-        stack_test_features.append(test_preds)
-        model_tags.append(name)
-        print(f"[Stack] {name}: processed CV {processed_cv:.6f}")
-    def run_siglip_model(name, estimator):
-        if cfg.fast_mode and cfg.siglip_fast_models and name not in cfg.siglip_fast_models:
-            print(f"[FastMode] Skipping SigLIP model {name}")
-            return
-        oof_preds, pred_test = cross_validate(
-            estimator,
+        train_siglip_df, test_siglip_df = append_cluster_features(
             train_siglip_df,
-            test_siglip_df,
-            feature_engine=feat_engine,
-            semantic_train=sem_train_full,
-            semantic_test=sem_test_full,
-            n_splits_override=cfg.stack_kfolds,
+            base_test_siglip_df.copy(),
+            embed_prefix='emb',
+            cluster_sizes=cfg.siglip_cluster_sizes,
+            random_state=cfg.seed,
         )
-        _, proc_score = compare_results(oof_preds, train_siglip_df, return_scores=True)
-        register_model(name, oof_preds, pred_test, proc_score)
+        train_siglip_df_legacy, test_siglip_df_legacy = append_cluster_features(
+            train_siglip_df_legacy,
+            base_test_siglip_df.copy(),
+            embed_prefix='emb',
+            cluster_sizes=cfg.siglip_cluster_sizes,
+            random_state=cfg.seed,
+        )
 
-    run_siglip_model("cat_seed0", CatBoostRegressor(verbose=0, random_seed=cfg.seed))
-    run_siglip_model("svr_seed0", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
-    run_siglip_model("xgb_seed0", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed))
-    run_siglip_model("bayes_ridge", BayesianRidge())
-    run_siglip_model("elastic_net", ElasticNet(alpha=0.08, l1_ratio=0.4, max_iter=2000))
-    run_siglip_model("extra_trees", ExtraTreesRegressor(n_estimators=600, max_depth=None, min_samples_split=4, min_samples_leaf=2, random_state=cfg.seed))
-    run_siglip_model("xgb_seed1", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed + 1881))
-    run_siglip_model("svr_seed1", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
-    run_siglip_model("cat_seed1", CatBoostRegressor(verbose=0, random_seed=cfg.seed + 404))
-    run_siglip_model("ridge_seed0", Ridge(alpha=0.5))
-    run_siglip_model("ridge_seed1", Ridge(alpha=0.4))
-    run_siglip_model("elastic_net_seed1", ElasticNet(alpha=0.06, l1_ratio=0.35, max_iter=2500))
-    weights = np.array(ensemble_weights, dtype=np.float64)
-    weights /= weights.sum()
-    pred_stack = np.stack(ensemble_preds, axis=0)
-    weighted_pred = np.tensordot(weights, pred_stack, axes=(0, 0))
-    print(f"Ensemble weights: {[round(w, 4) for w in weights.tolist()]}")
+        flush()
 
-    if stack_train_features:
-        stack_train_matrix = np.concatenate(stack_train_features, axis=1)
-        stack_test_matrix = np.concatenate(stack_test_features, axis=1)
-        stacker = Ridge(alpha=0.3)
-        stacker.fit(stack_train_matrix, train_siglip_df[TARGET_NAMES].values)
-        stack_train_pred = stacker.predict(stack_train_matrix)
-        stack_cv = competition_metric(train_siglip_df[TARGET_NAMES].values, stack_train_pred)
-        print(f"[Stack] Ridge layer CV: {stack_cv:.6f}")
-        stack_test_pred = stacker.predict(stack_test_matrix)
-        pred_advanced = 0.6 * stack_test_pred + 0.4 * weighted_pred
-    else:
-        pred_advanced = weighted_pred
+        sem_train_full = None
+        sem_test_full = None
+        if cfg.use_semantic_features:
+            X_all_emb = np.vstack([train_siglip_df.filter(like="emb").values, test_siglip_df.filter(like="emb").values])
+            try:
+                all_semantic_scores = generate_semantic_features(X_all_emb, model_path=siglip_path)
+                n_train = len(train_siglip_df)
+                sem_train_full = all_semantic_scores[:n_train]
+                sem_test_full = all_semantic_scores[n_train:]
+            except Exception as e:
+                sem_train_full = None
+                sem_test_full = None
+        else:
+            print("[FastMode] Skipping semantic feature generation for SigLIP pillar.")
 
-    mix = cfg.siglip_hybrid_weight
-    if mix < 1.0:
-        legacy_models = [
-            ("gb", GradientBoostingRegressor()),
-            ("hgb", HistGradientBoostingRegressor()),
-            ("cat", CatBoostRegressor(verbose=0)),
-            ("lgbm", LGBMRegressor(verbose=-1)),
-        ]
-        legacy_preds = []
-        for name, model in legacy_models:
-            oof_leg, pred_leg = cross_validate(
-                model,
-                train_siglip_df_legacy,
-                test_siglip_df_legacy,
+        if cfg.fast_mode:
+            feat_engine = SupervisedEmbeddingEngine(n_pca=0.95, n_pls=5, n_gmm=3)
+        else:
+            feat_engine = SupervisedEmbeddingEngine(n_pca=0.88, n_pls=10, n_gmm=5)
+
+        ensemble_preds = []
+        ensemble_weights = []
+        stack_train_features = []
+        stack_test_features = []
+        model_tags = []
+
+        def register_model(name, oof_preds, test_preds, processed_cv):
+            weight = max(processed_cv, 1e-6)
+            ensemble_preds.append(test_preds)
+            ensemble_weights.append(weight)
+            stack_train_features.append(oof_preds)
+            stack_test_features.append(test_preds)
+            model_tags.append(name)
+            print(f"[Stack] {name}: processed CV {processed_cv:.6f}")
+        def run_siglip_model(name, estimator):
+            if cfg.fast_mode and cfg.siglip_fast_models and name not in cfg.siglip_fast_models:
+                print(f"[FastMode] Skipping SigLIP model {name}")
+                return
+            oof_preds, pred_test = cross_validate(
+                estimator,
+                train_siglip_df,
+                test_siglip_df,
                 feature_engine=feat_engine,
                 semantic_train=sem_train_full,
                 semantic_test=sem_test_full,
-                n_splits_override=cfg.legacy_kfolds,
+                n_splits_override=cfg.stack_kfolds,
             )
-            _, proc_leg = compare_results(oof_leg, train_siglip_df_legacy, return_scores=True)
-            print(f"[Legacy] {name}: processed CV {proc_leg:.6f}")
-            legacy_preds.append(pred_leg)
-        pred_legacy = np.mean(legacy_preds, axis=0)
-        pred_test = mix * pred_advanced + (1 - mix) * pred_legacy
-        print(f"[SigLIP] Hybrid advanced/legacy weight: {mix:.2f}/{1 - mix:.2f}")
+            _, proc_score = compare_results(oof_preds, train_siglip_df, return_scores=True)
+            register_model(name, oof_preds, pred_test, proc_score)
+
+        run_siglip_model("cat_seed0", CatBoostRegressor(verbose=0, random_seed=cfg.seed))
+        run_siglip_model("svr_seed0", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
+        run_siglip_model("xgb_seed0", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed))
+        run_siglip_model("bayes_ridge", BayesianRidge())
+        run_siglip_model("elastic_net", ElasticNet(alpha=0.08, l1_ratio=0.4, max_iter=2000))
+        run_siglip_model("extra_trees", ExtraTreesRegressor(n_estimators=600, max_depth=None, min_samples_split=4, min_samples_leaf=2, random_state=cfg.seed))
+        run_siglip_model("xgb_seed1", XGBRegressor(n_estimators=700, learning_rate=0.02, max_depth=7, subsample=0.9, colsample_bytree=0.95, reg_lambda=1.0, reg_alpha=0.0, tree_method='hist', random_state=cfg.seed + 1881))
+        run_siglip_model("svr_seed1", SVR(kernel='rbf', C=0.7, epsilon=0.02, tol=1e-4, max_iter=100000, cache_size=2000))
+        run_siglip_model("cat_seed1", CatBoostRegressor(verbose=0, random_seed=cfg.seed + 404))
+        run_siglip_model("ridge_seed0", Ridge(alpha=0.5))
+        run_siglip_model("ridge_seed1", Ridge(alpha=0.4))
+        run_siglip_model("elastic_net_seed1", ElasticNet(alpha=0.06, l1_ratio=0.35, max_iter=2500))
+        weights = np.array(ensemble_weights, dtype=np.float64)
+        weights /= weights.sum()
+        pred_stack = np.stack(ensemble_preds, axis=0)
+        weighted_pred = np.tensordot(weights, pred_stack, axes=(0, 0))
+        print(f"Ensemble weights: {[round(w, 4) for w in weights.tolist()]}")
+
+        if stack_train_features:
+            stack_train_matrix = np.concatenate(stack_train_features, axis=1)
+            stack_test_matrix = np.concatenate(stack_test_features, axis=1)
+            stacker = Ridge(alpha=0.3)
+            stacker.fit(stack_train_matrix, train_siglip_df[TARGET_NAMES].values)
+            stack_train_pred = stacker.predict(stack_train_matrix)
+            stack_cv = competition_metric(train_siglip_df[TARGET_NAMES].values, stack_train_pred)
+            print(f"[Stack] Ridge layer CV: {stack_cv:.6f}")
+            stack_test_pred = stacker.predict(stack_test_matrix)
+            pred_advanced = 0.6 * stack_test_pred + 0.4 * weighted_pred
+        else:
+            pred_advanced = weighted_pred
+
+        mix = cfg.siglip_hybrid_weight
+        if mix < 1.0 and cfg.enable_legacy_siglip:
+            legacy_models = [
+                ("gb", GradientBoostingRegressor()),
+                ("hgb", HistGradientBoostingRegressor()),
+                ("cat", CatBoostRegressor(verbose=0)),
+                ("lgbm", LGBMRegressor(verbose=-1)),
+            ]
+            legacy_preds = []
+            for name, model in legacy_models:
+                oof_leg, pred_leg = cross_validate(
+                    model,
+                    train_siglip_df_legacy,
+                    test_siglip_df_legacy,
+                    feature_engine=feat_engine,
+                    semantic_train=sem_train_full,
+                    semantic_test=sem_test_full,
+                    n_splits_override=cfg.legacy_kfolds,
+                )
+                _, proc_leg = compare_results(oof_leg, train_siglip_df_legacy, return_scores=True)
+                print(f"[Legacy] {name}: processed CV {proc_leg:.6f}")
+                legacy_preds.append(pred_leg)
+            pred_legacy = np.mean(legacy_preds, axis=0)
+            pred_test = mix * pred_advanced + (1 - mix) * pred_legacy
+            print(f"[SigLIP] Hybrid advanced/legacy weight: {mix:.2f}/{1 - mix:.2f}")
+        else:
+            pred_test = pred_advanced
+
+        siglip_pred = pred_test
+        test_df[TARGET_NAMES] = pred_test
+        test_df = post_process_biomass(test_df)
+        sub_df = melt_table(test_df)
+        sub_df[['sample_id', 'target']].to_csv("submission1.csv", index=False)
+        pillar_paths["siglip"] = Path("submission1.csv")
     else:
-        pred_test = pred_advanced
-
-    test_df[TARGET_NAMES] = pred_test
-    test_df = post_process_biomass(test_df)
-    sub_df = melt_table(test_df)
-    sub_df[['sample_id', 'target']].to_csv("submission1.csv", index=False)
+        print("[Config] Skipping SigLIP stack.")
+        pillar_paths["siglip"] = None
 
 
-    print("Dinov2-L Pillar ===")
-    dinov2_path = "/kaggle/input/dinov2/pytorch/large/1"
-    dino_train_df = assign_folds(base_train_df.copy(), cfg.dino_kfolds, cfg.seed)
-    preview_embedding_columns(dino_train_df, "Dinov2 train (pre-strip)")
-    dino_train_df = strip_embedding_columns(dino_train_df, prefixes=("emb", "dino_emb"))
-    preview_embedding_columns(dino_train_df, "Dinov2 train (post-strip)")
-    dino_train_df["image_path"] = dino_train_df["image_path"].apply(ensure_abs_path)
-    dino_test_meta = pd.DataFrame({"image_path": test_df["image_path"].apply(ensure_abs_path)})
-    dino_test_meta = strip_embedding_columns(dino_test_meta, prefixes=("emb", "dino_emb"))
-    dino_train_df = compute_embeddings(dinov2_path, dino_train_df, patch_size=518)
-    dino_test_df = compute_embeddings(dinov2_path, dino_test_meta.copy(), patch_size=518)
-    dino_train_df, dino_emb_cols = rename_embedding_columns(dino_train_df, base_prefix="dino_emb")
-    dino_test_df, _ = rename_embedding_columns(dino_test_df, base_prefix="dino_emb")
-    preview_embedding_columns(dino_train_df, "Dinov2 train (post-rename)")
-    preview_embedding_columns(dino_test_df, "Dinov2 test (post-rename)")
-    dino_train_df, dino_test_df = append_cluster_features(
-        dino_train_df,
-        dino_test_df,
-        embed_prefix="dino_emb",
-        cluster_sizes=(16, 32, 48, 64, 80),
-        random_state=cfg.seed,
-    )
-    feat_engine_dino = SupervisedEmbeddingEngine(n_pca=0.995, n_pls=10, n_gmm=4)
+    dinov2_pred = None
+    if cfg.run_dinov2:
+        print("Dinov2-L Pillar ===")
+        dinov2_path = "/kaggle/input/dinov2/pytorch/large/1"
+        dino_train_df = assign_folds(base_train_df.copy(), cfg.dino_kfolds, cfg.seed)
+        preview_embedding_columns(dino_train_df, "Dinov2 train (pre-strip)")
+        dino_train_df = strip_embedding_columns(dino_train_df, prefixes=("emb", "dino_emb"))
+        preview_embedding_columns(dino_train_df, "Dinov2 train (post-strip)")
+        dino_train_df["image_path"] = dino_train_df["image_path"].apply(ensure_abs_path)
+        dino_test_meta = pd.DataFrame({"image_path": test_df["image_path"].apply(ensure_abs_path)})
+        dino_test_meta = strip_embedding_columns(dino_test_meta, prefixes=("emb", "dino_emb"))
+        dino_train_df = compute_embeddings(dinov2_path, dino_train_df, patch_size=518)
+        dino_test_df = compute_embeddings(dinov2_path, dino_test_meta.copy(), patch_size=518)
+        dino_train_df, dino_emb_cols = rename_embedding_columns(dino_train_df, base_prefix="dino_emb")
+        dino_test_df, _ = rename_embedding_columns(dino_test_df, base_prefix="dino_emb")
+        preview_embedding_columns(dino_train_df, "Dinov2 train (post-rename)")
+        preview_embedding_columns(dino_test_df, "Dinov2 test (post-rename)")
+        dino_train_df, dino_test_df = append_cluster_features(
+            dino_train_df,
+            dino_test_df,
+            embed_prefix="dino_emb",
+            cluster_sizes=(16, 32, 48, 64, 80),
+            random_state=cfg.seed,
+        )
+        feat_engine_dino = SupervisedEmbeddingEngine(n_pca=0.995, n_pls=10, n_gmm=4)
 
-    dino_preds = []
-    dino_oof = []
-    dino_weights = []
-    dino_tags = []
+        dino_preds = []
+        dino_oof = []
+        dino_weights = []
+        dino_tags = []
 
-    def register_dino(name, oof_preds, test_preds, processed_cv):
-        dino_preds.append(test_preds)
-        dino_oof.append(oof_preds)
-        dino_weights.append(max(processed_cv, 1e-6))
-        dino_tags.append(name)
-        print(f"[Dinov2] {name}: processed CV {processed_cv:.6f}")
+        def register_dino(name, oof_preds, test_preds, processed_cv):
+            dino_preds.append(test_preds)
+            dino_oof.append(oof_preds)
+            dino_weights.append(max(processed_cv, 1e-6))
+            dino_tags.append(name)
+            print(f"[Dinov2] {name}: processed CV {processed_cv:.6f}")
 
-    oof_dino_cat, pred_dino_cat = cross_validate(
-        CatBoostRegressor(verbose=0, random_seed=cfg.seed, iterations=900, depth=7, learning_rate=0.028),
-        dino_train_df,
-        dino_test_df,
-        feature_engine=feat_engine_dino,
-        semantic_train=sem_train_full,
-        semantic_test=sem_test_full,
-        n_splits_override=cfg.dino_kfolds,
-    )
-    _, proc_dino_cat = compare_results(oof_dino_cat, dino_train_df, return_scores=True)
-    register_dino("dinov2_cat", oof_dino_cat, pred_dino_cat, proc_dino_cat)
+        oof_dino_cat, pred_dino_cat = cross_validate(
+            CatBoostRegressor(verbose=0, random_seed=cfg.seed, iterations=900, depth=7, learning_rate=0.028),
+            dino_train_df,
+            dino_test_df,
+            feature_engine=feat_engine_dino,
+            semantic_train=sem_train_full,
+            semantic_test=sem_test_full,
+            n_splits_override=cfg.dino_kfolds,
+        )
+        _, proc_dino_cat = compare_results(oof_dino_cat, dino_train_df, return_scores=True)
+        register_dino("dinov2_cat", oof_dino_cat, pred_dino_cat, proc_dino_cat)
 
-    oof_dino_xgb, pred_dino_xgb = cross_validate(
-        XGBRegressor(
-            n_estimators=650, learning_rate=0.025, max_depth=7, subsample=0.9, colsample_bytree=0.95,
-            reg_lambda=1.3, reg_alpha=0.1, tree_method='hist', random_state=cfg.seed
-        ),
-        dino_train_df,
-        dino_test_df,
-        feature_engine=feat_engine_dino,
-        semantic_train=sem_train_full,
-        semantic_test=sem_test_full,
-        n_splits_override=cfg.dino_kfolds,
-    )
-    _, proc_dino_xgb = compare_results(oof_dino_xgb, dino_train_df, return_scores=True)
-    register_dino("dinov2_xgb", oof_dino_xgb, pred_dino_xgb, proc_dino_xgb)
+        oof_dino_xgb, pred_dino_xgb = cross_validate(
+            XGBRegressor(
+                n_estimators=650, learning_rate=0.025, max_depth=7, subsample=0.9, colsample_bytree=0.95,
+                reg_lambda=1.3, reg_alpha=0.1, tree_method='hist', random_state=cfg.seed
+            ),
+            dino_train_df,
+            dino_test_df,
+            feature_engine=feat_engine_dino,
+            semantic_train=sem_train_full,
+            semantic_test=sem_test_full,
+            n_splits_override=cfg.dino_kfolds,
+        )
+        _, proc_dino_xgb = compare_results(oof_dino_xgb, dino_train_df, return_scores=True)
+        register_dino("dinov2_xgb", oof_dino_xgb, pred_dino_xgb, proc_dino_xgb)
 
-    oof_dino_lgbm, pred_dino_lgbm = cross_validate(
-        LGBMRegressor(
-            n_estimators=900, learning_rate=0.03, num_leaves=192, subsample=0.85, colsample_bytree=0.9,
-            reg_lambda=0.9, reg_alpha=0.1, random_state=cfg.seed, verbose=-1
-        ),
-        dino_train_df,
-        dino_test_df,
-        feature_engine=feat_engine_dino,
-        semantic_train=sem_train_full,
-        semantic_test=sem_test_full,
-        n_splits_override=cfg.dino_kfolds,
-    )
-    _, proc_dino_lgbm = compare_results(oof_dino_lgbm, dino_train_df, return_scores=True)
-    register_dino("dinov2_lgbm", oof_dino_lgbm, pred_dino_lgbm, proc_dino_lgbm)
+        oof_dino_lgbm, pred_dino_lgbm = cross_validate(
+            LGBMRegressor(
+                n_estimators=900, learning_rate=0.03, num_leaves=192, subsample=0.85, colsample_bytree=0.9,
+                reg_lambda=0.9, reg_alpha=0.1, random_state=cfg.seed, verbose=-1
+            ),
+            dino_train_df,
+            dino_test_df,
+            feature_engine=feat_engine_dino,
+            semantic_train=sem_train_full,
+            semantic_test=sem_test_full,
+            n_splits_override=cfg.dino_kfolds,
+        )
+        _, proc_dino_lgbm = compare_results(oof_dino_lgbm, dino_train_df, return_scores=True)
+        register_dino("dinov2_lgbm", oof_dino_lgbm, pred_dino_lgbm, proc_dino_lgbm)
 
-    oof_dino_lasso, pred_dino_lasso = cross_validate(
-        Lasso(alpha=0.0005, max_iter=5000),
-        dino_train_df,
-        dino_test_df,
-        feature_engine=feat_engine_dino,
-        semantic_train=sem_train_full,
-        semantic_test=sem_test_full,
-        n_splits_override=cfg.dino_kfolds,
-    )
-    _, proc_dino_lasso = compare_results(oof_dino_lasso, dino_train_df, return_scores=True)
-    register_dino("dinov2_lasso", oof_dino_lasso, pred_dino_lasso, proc_dino_lasso)
+        oof_dino_lasso, pred_dino_lasso = cross_validate(
+            Lasso(alpha=0.0005, max_iter=5000),
+            dino_train_df,
+            dino_test_df,
+            feature_engine=feat_engine_dino,
+            semantic_train=sem_train_full,
+            semantic_test=sem_test_full,
+            n_splits_override=cfg.dino_kfolds,
+        )
+        _, proc_dino_lasso = compare_results(oof_dino_lasso, dino_train_df, return_scores=True)
+        register_dino("dinov2_lasso", oof_dino_lasso, pred_dino_lasso, proc_dino_lasso)
 
-    dino_weights = np.array(dino_weights, dtype=np.float64)
-    dino_weights /= dino_weights.sum()
-    dino_stack = np.stack(dino_preds, axis=0)
-    dino_weighted_pred = np.tensordot(dino_weights, dino_stack, axes=(0, 0))
-    dino_oof_stack = np.concatenate(dino_oof, axis=1)
-    dino_test_stack = np.concatenate(dino_preds, axis=1)
-    dino_meta = Ridge(alpha=0.25)
-    dino_meta.fit(dino_oof_stack, dino_train_df[TARGET_NAMES].values)
-    dino_meta_oof = dino_meta.predict(dino_oof_stack)
-    dino_meta_pred = dino_meta.predict(dino_test_stack)
-    meta_cv = competition_metric(dino_train_df[TARGET_NAMES].values, dino_meta_oof)
-    print(f"[Dinov2] Ridge meta CV: {meta_cv:.6f}")
+        dino_weights = np.array(dino_weights, dtype=np.float64)
+        dino_weights /= dino_weights.sum()
+        dino_stack = np.stack(dino_preds, axis=0)
+        dino_weighted_pred = np.tensordot(dino_weights, dino_stack, axes=(0, 0))
+        dino_oof_stack = np.concatenate(dino_oof, axis=1)
+        dino_test_stack = np.concatenate(dino_preds, axis=1)
+        dino_meta = Ridge(alpha=0.25)
+        dino_meta.fit(dino_oof_stack, dino_train_df[TARGET_NAMES].values)
+        dino_meta_oof = dino_meta.predict(dino_oof_stack)
+        dino_meta_pred = dino_meta.predict(dino_test_stack)
+        meta_cv = competition_metric(dino_train_df[TARGET_NAMES].values, dino_meta_oof)
+        print(f"[Dinov2] Ridge meta CV: {meta_cv:.6f}")
 
-    dino_weighted_oof = np.tensordot(dino_weights, np.stack(dino_oof, axis=0), axes=(0, 0))
-    dinov2_pred = 0.7 * dino_meta_pred + 0.3 * dino_weighted_pred
-    dinov2_cv = competition_metric(dino_train_df[TARGET_NAMES].values, 0.7 * dino_meta_oof + 0.3 * dino_weighted_oof)
-    print(f"[Dinov2] Blended CV: {dinov2_cv:.6f}")
+        dino_weighted_oof = np.tensordot(dino_weights, np.stack(dino_oof, axis=0), axes=(0, 0))
+        dinov2_pred = 0.7 * dino_meta_pred + 0.3 * dino_weighted_pred
+        dinov2_cv = competition_metric(dino_train_df[TARGET_NAMES].values, 0.7 * dino_meta_oof + 0.3 * dino_weighted_oof)
+        print(f"[Dinov2] Blended CV: {dinov2_cv:.6f}")
 
-    dinov2_out = dino_test_df[['image_path']].copy()
-    dinov2_out[TARGET_NAMES] = dinov2_pred
-    dinov2_out = post_process_biomass(dinov2_out)
-    dinov2_sub = melt_table(dinov2_out)
-    dinov2_sub[["sample_id", "target"]].to_csv("submission4.csv", index=False)
+        dinov2_out = dino_test_df[['image_path']].copy()
+        dinov2_out[TARGET_NAMES] = dinov2_pred
+        dinov2_out = post_process_biomass(dinov2_out)
+        dinov2_sub = melt_table(dinov2_out)
+        dinov2_sub[["sample_id", "target"]].to_csv("submission4.csv", index=False)
+        pillar_paths["dinov2"] = Path("submission4.csv")
+    else:
+        print("[Config] Skipping Dinov2 pillar.")
+        pillar_paths["dinov2"] = None
 
-    print("DINO Model 1 ===")
-    run_dino_inference()
+    if cfg.run_dino1:
+        print("DINO Model 1 ===")
+        run_dino_inference()
+        pillar_paths["dino"] = Path("submission3.csv") if Path("submission3.csv").exists() else None
+    else:
+        print("[Config] Skipping DINO Model 1 pillar.")
+        pillar_paths["dino"] = None
 
-    print("DINO Model 2 ===")
-    run_mvp_inference()
+    if cfg.run_mvp:
+        print("DINO Model 2 ===")
+        run_mvp_inference()
+        pillar_paths["mvp"] = Path("submission2.csv") if Path("submission2.csv").exists() else None
+    else:
+        print("[Config] Skipping MVP pillar.")
+        pillar_paths["mvp"] = None
 
-    submission1 = pd.read_csv('submission1.csv')
-    submission2 = pd.read_csv('submission2.csv')
-    submission3 = pd.read_csv('submission3.csv')
-    submission4 = pd.read_csv('submission4.csv')
+    blend_candidates = []
+    default_weights = {
+        "siglip": 0.50,
+        "dino": 0.25,
+        "mvp": 0.15,
+        "dinov2": 0.10,
+    }
+    submission_map = {
+        "siglip": Path("submission1.csv"),
+        "dino": Path("submission3.csv"),
+        "mvp": Path("submission2.csv"),
+        "dinov2": Path("submission4.csv"),
+    }
+    for key, path in submission_map.items():
+        if path.exists():
+            df = pd.read_csv(path)
+            blend_candidates.append((default_weights[key], df))
+        else:
+            print(f"[Blend] Missing {path}, skipping.")
 
-    merged = submission1.rename(columns={'target': 'target_1'})
-    merged = merged.merge(submission2.rename(columns={'target': 'target_2'}), on='sample_id')
-    merged = merged.merge(submission3.rename(columns={'target': 'target_3'}), on='sample_id')
-    merged = merged.merge(submission4.rename(columns={'target': 'target_4'}), on='sample_id')
+    if not blend_candidates:
+        raise RuntimeError("No pillar submissions available for blending.")
 
-    weight1, weight2, weight3, weight4 = 0.50, 0.25, 0.15, 0.10
-    merged['target'] = (
-        merged['target_1'] * weight1 +
-        merged['target_2'] * weight2 +
-        merged['target_3'] * weight3 +
-        merged['target_4'] * weight4
-    )
-    print(f"[Blend] Final weights (SigLIP/DINO/MVP/Dinov2): {weight1:.2f}/{weight2:.2f}/{weight3:.2f}/{weight4:.2f}")
+    merged = None
+    total_w = sum(w for w, _ in blend_candidates)
+    for idx, (w, df) in enumerate(blend_candidates, start=1):
+        col = f"target_{idx}"
+        df = df.rename(columns={"target": col})
+        if merged is None:
+            merged = df
+        else:
+            merged = merged.merge(df, on="sample_id")
+    weight_cols = [c for c in merged.columns if c.startswith("target_")]
+    weights = np.array([w for w, _ in blend_candidates], dtype=np.float64)
+    weights /= total_w
+    merged["target"] = sum(merged[col] * weights[i] for i, col in enumerate(weight_cols))
+    print(f"[Blend] Final weights (normalized): {', '.join(f'{w:.2f}' for w in weights.tolist())}")
 
     final_submission = merged[['sample_id', 'target']]
     final_submission.to_csv('submission.csv', index=False)
@@ -2125,10 +2183,10 @@ def main():
     pillar_dir = Path("pillar_outputs")
     pillar_dir.mkdir(exist_ok=True)
     pillar_sources = {
-        pillar_dir / "submission_siglip.csv": Path("submission1.csv"),
-        pillar_dir / "submission_dino.csv": Path("submission3.csv"),
-        pillar_dir / "submission_mvp.csv": Path("submission2.csv"),
-        pillar_dir / "submission_dinov2.csv": Path("submission4.csv"),
+        pillar_dir / "submission_siglip.csv": submission_map["siglip"],
+        pillar_dir / "submission_dino.csv": submission_map["dino"],
+        pillar_dir / "submission_mvp.csv": submission_map["mvp"],
+        pillar_dir / "submission_dinov2.csv": submission_map["dinov2"],
     }
     for dst, src in pillar_sources.items():
         if src.exists():
